@@ -18,13 +18,12 @@
 ## 第 1 步：下载代码并安装 MySQL
 
 ```bash
-# 拉取代码（MySQL 版在 feature/mysql 分支）
-cd /opt
-git clone -b feature/mysql https://github.com/xueni97/bazixuangu.git
-cd bazixuangu/deploy
+# 拉取代码到固定部署目录 /opt/bazixuangu
+git clone https://github.com/xueni97/bazixuangu-mysql.git /opt/bazixuangu
+cd /opt/bazixuangu/deploy
 
 # 如果 GitHub 很慢/超时，改用镜像：
-# git clone -b feature/mysql https://ghproxy.com/https://github.com/xueni97/bazixuangu.git
+# git clone https://ghproxy.com/https://github.com/xueni97/bazixuangu-mysql.git /opt/bazixuangu
 
 # 安装 MySQL 并创建数据库/账号（会让你输入数据库密码，自己定一个强密码）
 sudo bash setup_mysql.sh

@@ -2,14 +2,14 @@
 # ============================================================
 # 第 2 步：部署八字选股应用（先跑完 setup_mysql.sh 并配好 .env）
 # 用法：
-#   sudo bash setup_app.sh                 # 默认部署 feature/mysql 分支
-#   sudo BRANCH=main bash setup_app.sh     # 合并主干后改部署 main
+#   sudo bash setup_app.sh                 # 默认部署 main 分支
+#   sudo BRANCH=dev bash setup_app.sh      # 部署其他分支
 # ============================================================
 set -euo pipefail
 
-REPO_URL="https://github.com/xueni97/bazixuangu.git"
+REPO_URL="https://github.com/xueni97/bazixuangu-mysql.git"
 INSTALL_DIR="/opt/bazixuangu"
-BRANCH="${BRANCH:-feature/mysql}"
+BRANCH="${BRANCH:-main}"
 
 if [ "$EUID" -ne 0 ]; then
   echo "[!] 请用 sudo 执行"
