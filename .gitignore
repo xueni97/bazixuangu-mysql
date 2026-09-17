@@ -18,6 +18,7 @@ android/app/src/main/assets/public
 __pycache__
 *.pyc
 .venv
+.env
 
 # 本地数据
 *.db

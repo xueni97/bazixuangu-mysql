@@ -1,13 +1,17 @@
-"""八字选股后端测试。
+"""八字选股后端测试（MySQL 版）。
 
 运行:
+  # 先在 .env 或环境变量中配置好 DB_HOST/DB_USER/DB_PASSWORD
   cd bazi-stock-app
-  ..\\.venv\\Scripts\\python.exe -m pytest server/tests -v
+  python -m pytest server/tests -v
+
+测试使用独立库 bazixuangu_test（可用环境变量 TEST_DB_NAME 覆盖），
+本机没有可用 MySQL 时，需要连库的用例会自动 skip。
 """
 
 from __future__ import annotations
 
-import sqlite3
+import os
 import sys
 from pathlib import Path
 
@@ -16,45 +20,91 @@ import pytest
 SERVER_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SERVER_DIR))
 
+# 必须在 import db / data_sync 之前指定测试库
+os.environ["DB_NAME"] = os.environ.get("TEST_DB_NAME", "bazixuangu_test")
+
 import data_sync  # noqa: E402
+import db  # noqa: E402
+
+
+# ── 测试数据与辅助 ─────────────────────────────────────────
+
+
+NAMES = [
+    ("600519", "贵州茅台"),
+    ("000001", "平安银行"),
+    ("300750", "宁德时代"),
+    ("688981", "中芯国际"),
+    ("832000", "测试北交"),
+]
+
+
+def _seed_names(rows=NAMES):
+    conn = db.get_conn()
+    try:
+        with conn:
+            conn.executemany(
+                "REPLACE INTO stock_names (symbol, name, industry) VALUES (%s, %s, '')",
+                rows,
+            )
+    finally:
+        conn.close()
+
+
+def _seed_spot(rows):
+    conn = db.get_conn()
+    try:
+        with conn:
+            conn.executemany(
+                "REPLACE INTO stock_spot "
+                "(symbol, name, price, change_pct, market, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                rows,
+            )
+    finally:
+        conn.close()
 
 
 @pytest.fixture()
-def temp_db(tmp_path, monkeypatch):
-    """临时数据库，替换 data_sync.DB_PATH 与 app.DB_PATH。"""
-    db = tmp_path / "test.db"
-    monkeypatch.setattr(data_sync, "DB_PATH", db)
-    conn = sqlite3.connect(str(db))
-    conn.executescript(
-        """
-        CREATE TABLE stock_names (symbol TEXT PRIMARY KEY, name TEXT, industry TEXT);
-        CREATE TABLE stock_spot (symbol TEXT PRIMARY KEY, name TEXT, price REAL,
-            change_pct REAL, market TEXT, updated_at TEXT);
-        CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT);
-        """
-    )
-    conn.executemany(
-        "INSERT INTO stock_names VALUES (?, ?, '')",
-        [("600519", "贵州茅台"), ("000001", "平安银行"), ("300750", "宁德时代"),
-         ("688981", "中芯国际"), ("832000", "测试北交")],
-    )
-    conn.commit()
-    conn.close()
-    yield db
+def db_ready():
+    """确保 MySQL 测试库可用，不可用则跳过本用例。"""
+    try:
+        db.init_db(retries=1, delay=1)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"MySQL 不可用：{exc}")
+
+    conn = db.get_conn()
+    try:
+        with conn:
+            conn.execute("DELETE FROM stock_spot")
+            conn.execute("DELETE FROM stock_ma")
+            conn.execute("DELETE FROM stock_names")
+            conn.execute("DELETE FROM sync_meta")
+    finally:
+        conn.close()
+
+    # 重置内存状态机
+    data_sync._state.update(
+        status="idle", phase="", last_error="", started_at="", finished_at="")
+    data_sync._ma_state.update(
+        status="idle", phase="", last_error="", done=0, total=0,
+        started_at="", finished_at="")
+
+    _seed_names()
+    yield
 
 
 @pytest.fixture()
-def client(temp_db, monkeypatch):
+def client(db_ready):
     import app as app_module
 
-    monkeypatch.setattr(app_module, "DB_PATH", temp_db)
     app_module._sectors_cache.update(date="", source="", data={})
     app_module.app.config["TESTING"] = True
     with app_module.app.test_client() as c:
         yield c
 
 
-# ── data_sync 单元 ──────────────────────────────────────────
+# ── data_sync 纯函数单元（不连库） ──────────────────────────
 
 
 def test_classify_market():
@@ -111,7 +161,7 @@ def test_parse_sina_list():
     assert rows[1][2] == 12.0
 
 
-def test_fetch_chain_fallback(temp_db, monkeypatch):
+def test_fetch_chain_fallback(db_ready, monkeypatch):
     """东财与腾讯都失败时，自动切到新浪源成功。"""
     def em_fail():
         raise RuntimeError("em down")
@@ -130,7 +180,7 @@ def test_fetch_chain_fallback(temp_db, monkeypatch):
     assert rows == sina_rows
 
 
-def test_sync_state_machine(temp_db, monkeypatch):
+def test_sync_state_machine(db_ready, monkeypatch):
     """成功路径: idle → syncing → idle，且记录 last_success 与来源。"""
     good_rows = [("600519", "贵州茅台", 10.0, 1.0, "沪", "2026-09-12 10:00:00")]
     monkeypatch.setattr(
@@ -145,7 +195,7 @@ def test_sync_state_machine(temp_db, monkeypatch):
     assert data_sync.get_spot_count() == 1
 
 
-def test_sync_failure_keeps_state(temp_db, monkeypatch):
+def test_sync_failure_keeps_state(db_ready, monkeypatch):
     """所有数据源持续失败: 状态 failed，不写库。"""
     def boom():
         raise RuntimeError("网络超时")
@@ -162,7 +212,7 @@ def test_sync_failure_keeps_state(temp_db, monkeypatch):
     assert data_sync.get_last_success() is None
 
 
-def test_sync_idempotent_when_syncing(temp_db, monkeypatch):
+def test_sync_idempotent_when_syncing(db_ready, monkeypatch):
     """同步进行中再次触发 → 拒绝。"""
     import threading
 
@@ -209,16 +259,12 @@ def test_scan_fallback_to_names(client):
         assert key in body
 
 
-def test_scan_with_spot(client, temp_db):
+def test_scan_with_spot(client):
     """有快照时使用全市场 universe，结果带价格。"""
-    conn = sqlite3.connect(str(temp_db))
-    conn.executemany(
-        "INSERT INTO stock_spot VALUES (?, ?, ?, ?, ?, ?)",
-        [("600519", "贵州茅台", 1500.0, 2.5, "沪", "2026-09-12"),
-         ("000001", "平安银行", 12.0, -1.0, "深", "2026-09-12")],
-    )
-    conn.commit()
-    conn.close()
+    _seed_spot([
+        ("600519", "贵州茅台", 1500.0, 2.5, "沪", "2026-09-12"),
+        ("000001", "平安银行", 12.0, -1.0, "深", "2026-09-12"),
+    ])
 
     resp = client.get("/api/scan?min_score=-100&limit=10")
     body = resp.get_json()
@@ -229,17 +275,14 @@ def test_scan_with_spot(client, temp_db):
     assert by_symbol["600519"]["changePct"] == 2.5
 
 
-def test_search(client, temp_db):
+def test_search(client):
     resp = client.get("/api/search?q=茅台")
     body = resp.get_json()
     assert resp.status_code == 200
     assert body[0]["symbol"] == "600519"
     assert body[0]["price"] is None  # 无快照降级
 
-    conn = sqlite3.connect(str(temp_db))
-    conn.execute("INSERT INTO stock_spot VALUES ('600519','贵州茅台',1500.0,2.5,'沪','2026-09-12')")
-    conn.commit()
-    conn.close()
+    _seed_spot([("600519", "贵州茅台", 1500.0, 2.5, "沪", "2026-09-12")])
     body = client.get("/api/search?q=600519").get_json()
     assert body[0]["price"] == 1500.0
 
@@ -281,17 +324,13 @@ def test_scan_element_filter(client):
     assert all(r["element"] in {"火", "水"} for r in body["results"])
 
 
-def test_scan_market_and_price_filter(client, temp_db):
+def test_scan_market_and_price_filter(client):
     """市场与价格区间硬过滤。"""
-    conn = sqlite3.connect(str(temp_db))
-    conn.executemany(
-        "INSERT INTO stock_spot VALUES (?, ?, ?, ?, ?, ?)",
-        [("600519", "贵州茅台", 1500.0, 2.5, "沪", "2026-09-14"),
-         ("000001", "平安银行", 12.0, -1.0, "深", "2026-09-14"),
-         ("832000", "测试北交", 5.0, 0.0, "北交所", "2026-09-14")],
-    )
-    conn.commit()
-    conn.close()
+    _seed_spot([
+        ("600519", "贵州茅台", 1500.0, 2.5, "沪", "2026-09-14"),
+        ("000001", "平安银行", 12.0, -1.0, "深", "2026-09-14"),
+        ("832000", "测试北交", 5.0, 0.0, "北交所", "2026-09-14"),
+    ])
 
     body = client.get("/api/scan?min_score=-100&markets=沪").get_json()
     assert {r["symbol"] for r in body["results"]} <= {"600519"}
@@ -309,7 +348,7 @@ def test_scan_market_and_price_filter(client, temp_db):
 def test_composite_score_weighted_and_resonance():
     """综合评分 = 归一化加权 + 同向共振封顶；单周期退化为原日评分。"""
     from datetime import datetime
-    from sequoia_x.strategy.metaphysics import YuanhaiDecisionModel
+    from metaphysics import YuanhaiDecisionModel
 
     pd = YuanhaiDecisionModel.period_analyses(datetime(2026, 9, 14, 10))
     daily_only = YuanhaiDecisionModel.composite_score("火", pd, ["daily"], stock_name="测试")
@@ -404,25 +443,25 @@ def test_scan_ma_requires_sync(client):
     assert "均线" in resp.get_json()["error"]
 
 
-def test_scan_ma_filter(client, temp_db):
+def test_scan_ma_filter(client):
     """ma=144 仅保留回踩144日线的标的；结果带均线与距离字段。"""
-    conn = sqlite3.connect(str(temp_db))
-    data_sync.ensure_tables(conn)  # 补建 stock_ma 表
-    conn.executemany(
-        "INSERT INTO stock_spot VALUES (?, ?, ?, ?, ?, ?)",
-        [("600519", "贵州茅台", 10.0, 0.0, "沪", "2026-09-12"),
-         ("000001", "平安银行", 10.0, 0.0, "深", "2026-09-12")],
-    )
-    conn.execute(
-        "INSERT INTO sync_meta VALUES ('ma_trade_date', '2026-09-11')")
-    conn.executemany(
-        "INSERT INTO stock_ma (symbol, trade_date, close, high20, bars, ma144, ma288, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [("600519", "2026-09-11", 10.0, 11.0, 300, 10.0, 9.9, "t"),  # 回踩144/288
-         ("000001", "2026-09-11", 10.0, 12.5, 300, 12.0, 12.0, "t")],  # 偏离-16.7%
-    )
-    conn.commit()
-    conn.close()
+    _seed_spot([
+        ("600519", "贵州茅台", 10.0, 0.0, "沪", "2026-09-12"),
+        ("000001", "平安银行", 10.0, 0.0, "深", "2026-09-12"),
+    ])
+    conn = db.get_conn()
+    try:
+        with conn:
+            conn.execute(
+                "REPLACE INTO sync_meta (meta_key, value) VALUES ('ma_trade_date', '2026-09-11')")
+            conn.executemany(
+                "REPLACE INTO stock_ma (symbol, trade_date, close, high20, bars, ma144, ma288, "
+                "updated_at, source) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                [("600519", "2026-09-11", 10.0, 11.0, 300, 10.0, 9.9, "t", "em"),  # 回踩
+                 ("000001", "2026-09-11", 10.0, 12.5, 300, 12.0, 12.0, "t", "em")],  # 偏离
+            )
+    finally:
+        conn.close()
 
     body = client.get("/api/scan?min_score=-100&ma=144").get_json()
     assert body["maFilter"] == [144] and body["maTradeDate"] == "2026-09-11"
@@ -462,7 +501,7 @@ def test_sync_endpoints(client, monkeypatch):
         assert k in body
 
 
-def test_sync_ma_pipeline(temp_db, monkeypatch):
+def test_sync_ma_pipeline(db_ready, monkeypatch):
     """均线同步状态机：并发拉取→计算→落 stock_ma + meta（全程不联网）。"""
     # 名称库 5 只标的，每只 300 根收盘 10 的日K（末日=目标交易日）
     klines = [(f"2025-{i // 30 + 1:02d}-{i % 28 + 1:02d}", 10.0) for i in range(300)]
@@ -479,10 +518,13 @@ def test_sync_ma_pipeline(temp_db, monkeypatch):
     assert st["ma_status"] == "idle" and st["ma_count"] == 5
     assert st["ma_trade_date"] == "2026-09-12"
 
-    conn = sqlite3.connect(str(temp_db))
-    row = conn.execute(
-        "SELECT ma144, ma288, bars, source FROM stock_ma WHERE symbol='600519'").fetchone()
-    conn.close()
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            "SELECT ma144, ma288, bars, source FROM stock_ma WHERE symbol='600519'"
+        ).fetchone()
+    finally:
+        conn.close()
     assert row == (10.0, 10.0, 300, "em")
 
     # 同一交易日再跑 → 跳过
@@ -492,16 +534,11 @@ def test_sync_ma_pipeline(temp_db, monkeypatch):
 
 def test_index_spa_fallback(client):
     """根路径与未知路径返回 index.html（hash 路由 SPA）。"""
-    dist = Path(app_static_dir())
-    index_file = dist / "index.html"
+    import app as app_module
+
+    index_file = Path(app_module.app.static_folder) / "index.html"
     if not index_file.exists():
         pytest.skip("dist 未构建")
     resp = client.get("/")
     assert resp.status_code == 200
     assert b"app" in resp.data
-
-
-def app_static_dir() -> str:
-    import app as app_module
-
-    return app_module.app.static_folder

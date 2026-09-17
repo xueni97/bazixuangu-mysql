@@ -15,17 +15,16 @@ from __future__ import annotations
 
 import json
 import math
-import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
 
+import pymysql
 import requests
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "sequoia_v2.db"
+from db import create_tables as ensure_tables  # noqa: F401  保留旧函数名，调用方无需改
+from db import get_conn
 
 MAX_RETRIES_PER_SOURCE = 2
 RETRY_INTERVAL = 3  # 秒
@@ -42,36 +41,6 @@ _state = {
 }
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def ensure_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS stock_spot ("
-        "symbol TEXT PRIMARY KEY, name TEXT, price REAL, "
-        "change_pct REAL, market TEXT, updated_at TEXT)"
-    )
-    # 长周期均线指标（144/288 日线），由独立的日K同步任务每日刷新
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS stock_ma ("
-        "symbol TEXT PRIMARY KEY, trade_date TEXT, close REAL, high20 REAL, "
-        "bars INTEGER, ma144 REAL, ma288 REAL, updated_at TEXT, "
-        "source TEXT DEFAULT 'em')"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sync_meta ("
-        "key TEXT PRIMARY KEY, value TEXT)"
-    )
-    # 旧库迁移：source 标记日K来源（em 前复权 / tx 前复权 / sina 不复权）
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(stock_ma)")}
-    if "source" not in cols:
-        conn.execute("ALTER TABLE stock_ma ADD COLUMN source TEXT DEFAULT 'em'")
-    conn.commit()
-
-
 def get_state() -> dict:
     """当前同步状态（供 API 查询，含快照与均线两套状态）。"""
     with _lock:
@@ -84,13 +53,10 @@ def get_state() -> dict:
 
 
 def get_last_success() -> str | None:
-    if not DB_PATH.exists():
-        return None
     conn = get_conn()
     try:
-        ensure_tables(conn)
         row = conn.execute(
-            "SELECT value FROM sync_meta WHERE key = 'last_success_date'"
+            "SELECT value FROM sync_meta WHERE meta_key = 'last_success_date'"
         ).fetchone()
         return row[0] if row else None
     finally:
@@ -98,12 +64,11 @@ def get_last_success() -> str | None:
 
 
 def get_spot_count() -> int:
-    if not DB_PATH.exists():
-        return 0
     conn = get_conn()
     try:
-        ensure_tables(conn)
         return conn.execute("SELECT COUNT(*) FROM stock_spot").fetchone()[0]
+    except pymysql.MySQLError:
+        return 0
     finally:
         conn.close()
 
@@ -215,7 +180,7 @@ def _parse_tencent_text(text: str) -> list[tuple]:
     return rows
 
 
-def _fetch_tencent(conn: sqlite3.Connection) -> list[tuple]:
+def _fetch_tencent(conn) -> list[tuple]:
     """按 stock_names 全表代码，腾讯批量行情拉取。"""
     names = conn.execute("SELECT symbol FROM stock_names ORDER BY symbol").fetchall()
     symbols = [r[0] for r in names]
@@ -607,13 +572,12 @@ def near_ma(price, ma, high20, tol: float) -> tuple[bool, float | None]:
     return True, round(dist, 4)
 
 
-def _get_meta(key: str) -> str | None:
-    if not DB_PATH.exists():
-        return None
+def _get_meta(meta_key: str) -> str | None:
     conn = get_conn()
     try:
-        ensure_tables(conn)
-        row = conn.execute("SELECT value FROM sync_meta WHERE key=?", (key,)).fetchone()
+        row = conn.execute(
+            "SELECT value FROM sync_meta WHERE meta_key=%s", (meta_key,)
+        ).fetchone()
         return row[0] if row else None
     finally:
         conn.close()
@@ -637,12 +601,11 @@ def get_ma_state() -> dict:
 
 
 def get_ma_count() -> int:
-    if not DB_PATH.exists():
-        return 0
     conn = get_conn()
     try:
-        ensure_tables(conn)
         return conn.execute("SELECT COUNT(*) FROM stock_ma").fetchone()[0]
+    except pymysql.MySQLError:
+        return 0
     finally:
         conn.close()
 
@@ -656,13 +619,13 @@ def _latest_trade_date(session: requests.Session) -> str | None:
         return None
 
 
-def _universe_symbols(conn: sqlite3.Connection) -> list[str]:
+def _universe_symbols(conn) -> list[str]:
     """均线同步标的：快照表优先，空则降级名称表。"""
     try:
         rows = conn.execute("SELECT symbol FROM stock_spot ORDER BY symbol").fetchall()
         if rows:
             return [r[0] for r in rows]
-    except sqlite3.OperationalError:
+    except pymysql.MySQLError:
         pass
     rows = conn.execute("SELECT symbol FROM stock_names ORDER BY symbol").fetchall()
     return [r[0] for r in rows]
@@ -760,20 +723,20 @@ def sync_ma(force: bool = False) -> dict:
                 ensure_tables(conn)
                 with conn:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO stock_ma "
+                        "REPLACE INTO stock_ma "
                         "(symbol, trade_date, close, high20, bars, ma144, ma288, "
                         "updated_at, source) "
-                        "VALUES (:symbol, :trade_date, :close, :high20, :bars, "
-                        ":ma144, :ma288, :updated_at, :source)",
+                        "VALUES (%(symbol)s, %(trade_date)s, %(close)s, %(high20)s, %(bars)s, "
+                        "%(ma144)s, %(ma288)s, %(updated_at)s, %(source)s)",
                         [{**r, "updated_at": now} for r in batch],
                     )
                     if mark_meta:
                         conn.execute(
-                            "INSERT OR REPLACE INTO sync_meta (key, value) "
-                            "VALUES ('ma_trade_date', ?)", (eff,))
+                            "REPLACE INTO sync_meta (meta_key, value) "
+                            "VALUES ('ma_trade_date', %s)", (eff,))
                         conn.execute(
-                            "INSERT OR REPLACE INTO sync_meta (key, value) "
-                            "VALUES ('ma_updated_at', ?)", (now,))
+                            "REPLACE INTO sync_meta (meta_key, value) "
+                            "VALUES ('ma_updated_at', %s)", (now,))
             finally:
                 conn.close()
 
@@ -834,21 +797,25 @@ def sync_ma_async(force: bool = False) -> dict:
 def _write_rows(rows: list[tuple], source: str) -> None:
     conn = get_conn()
     try:
-        ensure_tables(conn)
         with conn:
             conn.execute("DELETE FROM stock_spot")
             conn.executemany(
-                "INSERT OR REPLACE INTO stock_spot "
+                "REPLACE INTO stock_spot "
                 "(symbol, name, price, change_pct, market, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, %s, %s)",
                 rows,
             )
+            # 快照同时维护名称库（独立部署后不再依赖 baostock / 父项目数据库）
+            conn.executemany(
+                "REPLACE INTO stock_names (symbol, name) VALUES (%s, %s)",
+                [(r[0], r[1]) for r in rows if r[1]],
+            )
             conn.execute(
-                "INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_success_date', ?)",
+                "REPLACE INTO sync_meta (meta_key, value) VALUES ('last_success_date', %s)",
                 (datetime.now().strftime("%Y-%m-%d"),),
             )
             conn.execute(
-                "INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_source', ?)",
+                "REPLACE INTO sync_meta (meta_key, value) VALUES ('last_source', %s)",
                 (source,),
             )
     finally:
@@ -862,7 +829,6 @@ def _fetch_snapshot() -> tuple[list[tuple], str]:
     """
     conn = get_conn()
     try:
-        ensure_tables(conn)
         sources = [
             ("eastmoney", lambda: _fetch_eastmoney()),
             ("tencent", lambda: _fetch_tencent(conn)),

@@ -1,0 +1,8 @@
+# 八字选股后端 Python 依赖（Python >= 3.10）
+flask>=3.0
+pymysql>=1.1.0
+requests>=2.31
+python-dotenv>=1.0
+
+# 生产 WSGI 服务器（Linux 服务器用；Windows 本地直接 python server/app.py）
+gunicorn>=21.2; sys_platform != "win32"

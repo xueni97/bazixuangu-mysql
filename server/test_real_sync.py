@@ -19,9 +19,9 @@ print(f"快照数量: {data_sync.get_spot_count()}")
 conn = data_sync.get_conn()
 for code in ("600519", "000001", "300750", "688981", "833533", "920000"):
     row = conn.execute(
-        "SELECT symbol, name, price, change_pct, market FROM stock_spot WHERE symbol = ?", (code,)
+        "SELECT symbol, name, price, change_pct, market FROM stock_spot WHERE symbol = %s", (code,)
     ).fetchone()
-    print("抽查:", dict(row) if row else f"{code} 不在快照中")
+    print("抽查:", row if row else f"{code} 不在快照中")
 
 # 市场分布
 dist = conn.execute("SELECT market, COUNT(*) FROM stock_spot GROUP BY market").fetchall()

@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""从 sequoia_x.strategy.metaphysics.stock_element 导出五行数据表为 JS，
+"""从 server/metaphysics/stock_element.py 导出五行数据表为 JS，
 避免手动转录汉字出错。重新生成：python scripts/generate_stock_data.py
 """
 import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, r'c:\SVN\Seq\Sequoia-X')
-from sequoia_x.strategy.metaphysics import stock_element as se  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "server"))
+from metaphysics import stock_element as se  # noqa: E402
 
 
 def j(s):

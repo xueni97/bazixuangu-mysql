@@ -1,0 +1,19 @@
+[Unit]
+Description=Bazixuangu Flask API (gunicorn)
+After=network.target mysql.service
+Requires=mysql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bazixuangu/server
+# 单进程多线程：后台行情同步任务是进程内状态机，多 worker 会重复触发同步
+ExecStart=/opt/bazixuangu/.venv/bin/gunicorn \
+    --workers 1 --threads 4 --timeout 120 \
+    --bind 127.0.0.1:5175 app:app
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/bazixuangu/.env
+
+[Install]
+WantedBy=multi-user.target

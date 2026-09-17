@@ -1,43 +1,41 @@
-"""渊海子平命理选股 Flask 后端。
+"""渊海子平命理选股 Flask 后端（独立部署版 · MySQL 存储）。
 
 职责：
-1. 数据同步：akshare 全市场快照（data_sync.py，启动自动检测 + 手动触发）
+1. 数据同步：全市场行情快照（data_sync.py，多数据源 fallback，启动自动检测 + 手动触发）
 2. API：股票搜索 / 全市场命理扫描 / 同步状态 / 五行分布
-3. 页面托管：serve dist/（电脑浏览器大屏入口，监听 0.0.0.0 供手机局域网联用）
+3. 页面托管：serve dist/（电脑浏览器大屏入口，监听 0.0.0.0）
 
 运行方式:
-  cd c:\\SVN\\Seq\\Sequoia-X\\bazi-stock-app
-  ..\\.venv\\Scripts\\python.exe server\\app.py
+  cd bazi-stock-app
+  pip install -r requirements.txt
+  python server/app.py
 """
 
 from __future__ import annotations
 
+import os
 import socket
-import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
 from flask import Blueprint, Flask, jsonify, request, send_from_directory
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from sequoia_x.strategy.metaphysics import (  # noqa: E402
+# server/ 在以 `python server/app.py` 启动时会自动加入 sys.path，
+# 命理引擎已内置到 server/metaphysics/，不再依赖外部项目。
+from metaphysics import (  # noqa: E402
     StockElementAnalyzer,
     YuanhaiDecisionModel,
 )
 
 from data_sync import (  # noqa: E402
-    DB_PATH,
-    ensure_tables,
-    get_conn,
     get_spot_count,
     get_state,
     near_ma,
     sync_ma_async,
-    sync_spot,
     sync_spot_async,
 )
+from db import DB_NAME, get_conn, init_db  # noqa: E402
 
 app = Flask(__name__, static_folder=str(Path(__file__).parent.parent / "dist"), static_url_path="")
 
@@ -86,7 +84,7 @@ def _get_universe(conn):
 def health():
     return jsonify({
         "status": "ok",
-        "db_exists": DB_PATH.exists(),
+        "db": DB_NAME,
         "spot_count": get_spot_count(),
     })
 
@@ -94,11 +92,8 @@ def health():
 @api.route("/stock-names")
 def stock_names():
     """获取股票名称列表（全量）。"""
-    if not DB_PATH.exists():
-        return _json_err("数据库不存在", 404)
     conn = get_conn()
     try:
-        ensure_tables(conn)
         rows = conn.execute("SELECT symbol, name FROM stock_names ORDER BY symbol").fetchall()
         return jsonify([{"symbol": r[0], "name": r[1]} for r in rows])
     finally:
@@ -111,17 +106,14 @@ def search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify([])
-    if not DB_PATH.exists():
-        return _json_err("数据库不存在", 404)
 
     conn = get_conn()
     try:
-        ensure_tables(conn)
         like = f"%{q}%"
         if get_spot_count() > 0:
             rows = conn.execute(
                 "SELECT symbol, name, price, change_pct FROM stock_spot "
-                "WHERE symbol LIKE ? OR name LIKE ? LIMIT 20",
+                "WHERE symbol LIKE %s OR name LIKE %s LIMIT 20",
                 (like, like),
             ).fetchall()
             return jsonify([
@@ -129,7 +121,7 @@ def search():
                 for r in rows
             ])
         rows = conn.execute(
-            "SELECT symbol, name FROM stock_names WHERE symbol LIKE ? OR name LIKE ? LIMIT 20",
+            "SELECT symbol, name FROM stock_names WHERE symbol LIKE %s OR name LIKE %s LIMIT 20",
             (like, like),
         ).fetchall()
         return jsonify([{"symbol": r[0], "name": r[1], "price": None, "changePct": None}
@@ -152,9 +144,6 @@ def scan():
       ma_tol: 均线附近容差（默认0.03=±3%，范围0.5%~10%）
       min_score（默认10）、limit（默认100）
     """
-    if not DB_PATH.exists():
-        return _json_err("数据库不存在", 404)
-
     now = datetime.now()
     year = int(request.args.get("year", now.year))
     month = int(request.args.get("month", now.month))
@@ -221,14 +210,13 @@ def scan():
 
     conn = get_conn()
     try:
-        ensure_tables(conn)
         rows, source = _get_universe(conn)
         # 均线表（可能尚未同步：表为空）
         ma_rows = conn.execute(
             "SELECT symbol, trade_date, close, high20, ma144, ma288 FROM stock_ma"
         ).fetchall()
         ma_meta = conn.execute(
-            "SELECT value FROM sync_meta WHERE key='ma_trade_date'"
+            "SELECT value FROM sync_meta WHERE meta_key='ma_trade_date'"
         ).fetchone()
     finally:
         conn.close()
@@ -343,16 +331,12 @@ def scan():
 @api.route("/sectors")
 def sectors():
     """全 universe 按五行分组计数（大屏分布图用，按日缓存）。"""
-    if not DB_PATH.exists():
-        return _json_err("数据库不存在", 404)
-
     today = datetime.now().strftime("%Y-%m-%d")
     if _sectors_cache["date"] == today and _sectors_cache["data"]:
         return jsonify(_sectors_cache["data"])
 
     conn = get_conn()
     try:
-        ensure_tables(conn)
         rows, source = _get_universe(conn)
     finally:
         conn.close()
@@ -393,6 +377,10 @@ def sync_status():
 
 app.register_blueprint(api)
 
+# gunicorn（server.app:app）启动时同样确保库表就绪；测试可设 SKIP_DB_INIT=1 跳过。
+if os.getenv("SKIP_DB_INIT") != "1":
+    init_db()
+
 
 # ── 静态页面托管（电脑大屏入口） ──────────────────────────────
 
@@ -411,27 +399,30 @@ def not_found(_e):
 
 
 if __name__ == "__main__":
-    import threading
+    import sys
     import webbrowser
 
-    if not DB_PATH.exists():
-        print(f"[!] 数据库不存在: {DB_PATH}")
-    else:
-        print(f"[i] 数据库: {DB_PATH}")
+    # 1. 确保数据库与表就绪（MySQL 未启动时会自动等待重试）
+    print(f"[i] 连接 MySQL 并初始化数据库 {DB_NAME} ...")
+    init_db()
+    print("[i] 数据库就绪")
 
-    # 启动时自动检测：当日无快照则后台同步（不阻塞服务）
+    # 2. 启动时自动检测：当日无快照则后台同步（不阻塞服务）
     print(f"[i] 同步检测: {sync_spot_async()['message']}")
 
-    # 打印局域网地址（手机联用）
+    # 3. 打印访问地址
+    port = 5175
     try:
         hostname = socket.gethostname()
         lan_ip = socket.gethostbyname(hostname)
-        print(f"[i] 电脑大屏: http://127.0.0.1:5175")
-        print(f"[i] 手机联用: http://{lan_ip}:5175 （需同一WiFi，在APP设置中填入）")
+        print(f"[i] 本机访问: http://127.0.0.1:{port}")
+        print(f"[i] 局域网/外网: http://{lan_ip}:{port}")
     except OSError:
         pass
 
-    # 延迟2秒自动打开浏览器（等待 Flask 起来）
-    threading.Timer(2, lambda: webbrowser.open("http://127.0.0.1:5175")).start()
+    # 4. 仅在本机桌面环境自动打开浏览器（云服务器无桌面，跳过）
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        threading.Timer(2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
 
-    app.run(host="0.0.0.0", port=5175, debug=False)
+    # 生产环境建议用 gunicorn，见 deploy/ 目录
+    app.run(host="0.0.0.0", port=port, debug=False)
